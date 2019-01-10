@@ -4,6 +4,7 @@ require 'zlib'
 require 'time'
 require 'tempfile'
 require 'fluent/plugin/output'
+require 'fluent/timezone'
 
 module Fluent::Plugin
   class AzureStorageOutput < Fluent::Plugin::Output
@@ -46,10 +47,10 @@ module Fluent::Plugin
       super
 
       begin
-        @compressor = COMPRESSOR_REGISTRY.lookup(@store_as).new(:buffer_type => @buffer_type, :log => log)
+        @compressor = COMPRESSOR_REGISTRY.lookup(@store_as).new(:buffer_type => @buffer_type, :log => log, :buffer_compress => @buffer.compress)
       rescue => e
         log.warn "#{@store_as} not found. Use 'text' instead"
-        @compressor = TextCompressor.new
+        @compressor = TextCompressor.new(:buffer_type => @buffer_type, :log => log, :buffer_compress => @buffer.compress)
       end
       @compressor.configure(conf)
 
@@ -80,6 +81,7 @@ module Fluent::Plugin
       # For backward compatibility
       # TODO: Remove time_slice_format when end of support compat_parameters
       @configured_time_slice_format = conf['time_slice_format']
+      @time_slice_with_tz = Fluent::Timezone.formatter(@timekey_zone, @configured_time_slice_format)
     end
 
     def multi_workers_ready?
@@ -110,11 +112,10 @@ module Fluent::Plugin
       i = 0
       metadata = chunk.metadata
       previous_path = nil
-      time_slice_format = @configured_time_slice_format || timekey_to_timeformat(@buffer_config['timekey'])
       time_slice = if metadata.timekey.nil?
                      ''.freeze
                    else
-                     Time.at(metadata.timekey).utc.strftime(time_slice_format)
+                     @time_slice_with_tz.call(metadata.timekey)
                    end
 
       begin
@@ -124,6 +125,7 @@ module Fluent::Plugin
           "%{time_slice}" => time_slice,
           "%{file_extension}" => @compressor.ext,
           "%{index}" => i,
+          "%{hostname}" => Socket.gethostname,
           "%{uuid_flush}" => uuid_random
         }
         storage_path = @azure_object_key_format.gsub(%r(%{[^}]+}), values_for_object_key)
@@ -184,9 +186,10 @@ module Fluent::Plugin
         super()
         @buffer_type = opts[:buffer_type]
         @log = opts[:log]
+        @buffer_compress = opts[:buffer_compress]
       end
 
-      attr_reader :buffer_type, :log
+      attr_reader :buffer_type, :log, :buffer_compress
 
       def configure(conf)
         super
@@ -225,6 +228,18 @@ module Fluent::Plugin
       end
 
       def compress(chunk, tmp)
+        if @buffer_compress == :gzip
+          compress_from_gzipped_chunk(chunk, tmp)
+        else
+          compress_from_chunk(chunk, tmp)
+        end
+      end
+
+      def compress_from_gzipped_chunk(chunk, tmp)
+        chunk.write_to(tmp, compressed: :gzip)
+      end
+
+      def compress_from_chunk(chunk, tmp)
         w = Zlib::GzipWriter.new(tmp)
         chunk.write_to(w)
         w.finish
